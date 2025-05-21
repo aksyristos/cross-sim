@@ -6,7 +6,7 @@ Run this after calibrating crossbar inputs!
 import torch
 from torchvision import datasets, transforms
 import numpy as np
-import warnings, sys, time
+import warnings, sys, time, os
 from build_resnet_cifar10 import ResNet_cifar10
 warnings.filterwarnings('ignore')
 #sys.path.append("../../") # to import dnn_inference_params
