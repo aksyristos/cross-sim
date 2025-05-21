@@ -1,5 +1,5 @@
 import numpy as np
-
+import os
 def find_adc_range(params_args, n_layers, depth):
     """
     Given a set of arguments to dnn_inference_params(), find a compatible set
@@ -32,7 +32,7 @@ def find_adc_range(params_args, n_layers, depth):
     #   - Whether input bit accumulation is done in analog (relevant for offset and bit slicing)
     #   - For balanced core, whether current is subtracted in analog (here, always assumed true)
  
-    limits_dir = "./calibrated_config/"
+    limits_dir = os.path.join(os.path.dirname(__file__),"calibrated_config/")
 
     if adc_bits > 0 and adc_range_option == "CALIBRATED":
 
