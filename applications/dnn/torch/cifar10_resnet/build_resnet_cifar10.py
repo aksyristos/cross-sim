@@ -1,163 +1,88 @@
-"""
-Parameterizable inference simulation script for CIFAR-10 ResNets.
-"""
-import os
 import torch
-from torchvision import datasets, transforms
+import torch.nn as nn
 import numpy as np
-import warnings, sys, time
-from build_resnet_cifar10 import ResNet_cifar10
-warnings.filterwarnings('ignore')
-#sys.path.append("../../") # to import dnn_inference_params
-#sys.path.append("../../../../") # to import simulator
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),"../../"))) # to import dnn_inference_params
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),"../../../../"))) # to import simulator
-from simulator import CrossSimParameters
-from simulator.algorithms.dnn.torch.convert import from_torch, convertible_modules, reinitialize
-from find_adc_range import find_adc_range
-from dnn_inference_params import dnn_inference_params
+import time
+import os
+import copy
+import sys
 
-## Depth parameter for model selection
-# Follows definition in original ResNet paper (He et al, CVPR 2016)
-# n = 2 : ResNet-14 (175K weights)
-# n = 3 : ResNet-20 (272K weights)
-# n = 5 : ResNet-32 (467K weights)
-# n = 9 : ResNet-56 (856K weights)
-n = 3
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, inplanes, planes, stride=1, downsample=None,
+                 norm_layer=None):
+        super(BasicBlock,self).__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes,stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
 
-useGPU = False # use GPU?
-N = 10000 # number of images
-batch_size = 64
-Nruns = 1
-print_progress = True
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out = out + identity
+        out = self.relu(out)
+        return out
 
-depth = 6*n+2
-print("Model: ResNet-{:d}".format(depth))
-print("CIFAR-10: using "+("GPU" if useGPU else "CPU"))
-print("Number of images: {:d}".format(N))
-print("Number of runs: {:d}".format(Nruns))
-print("Batch size: {:d}".format(batch_size))
-device = torch.device("cuda:0" if (torch.cuda.is_available() and useGPU) else "cpu")
+def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
 
-##### Load Pytorch model
-resnet_model = ResNet_cifar10(n)
-resnet_model = resnet_model.to(device)
-#resnet_model.load_state_dict(
-#    torch.load('./models/resnet{:d}_cifar10.pth'.format(depth),
-#    map_location=torch.device(device)))
-model_path = os.path.join(os.path.dirname(__file__), 'models','resnet{:d}_cifar10.pth'.format(depth))
-resnet_model.load_state_dict(
-      torch.load(model_path, map_location=torch.device(device)))
-resnet_model.eval()
-n_layers = len(convertible_modules(resnet_model))
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
-##### Set the simulation parameters
 
-# Create a list of CrossSimParameters objects
-params_list = [None] * n_layers
+class ResNet_cifar10(nn.Module):
 
-# Params arguments common to all layers
-base_params_args = {
-    'ideal' : False,
-    ## Mapping style
-    'core_style' : "BALANCED",
-    'Nslices' : 1,
-    ## Weight value representation and precision
-    'weight_bits' : 8,
-    'weight_percentile' : 100,
-    'digital_bias' : True,
-    ## Memory device
-    'Rmin' : 1e4,
-    'Rmax' : 1e6,
-    'infinite_on_off_ratio' : False,
-    'error_model' : "none",
-    'alpha_error' : 0.0,
-    'proportional_error' : False,
-    'noise_model' : "none",
-    'alpha_noise' : 0.0,
-    'proportional_noise' : False,
-    'drift_model' : "none",
-    't_drift' : 0,
-    ## Array properties
-    'NrowsMax' : 1152,
-    'NcolsMax' : None,
-    'Rp_row' : 0, # ohms
-    'Rp_col' : 0, # ohms
-    'interleaved_posneg' : False,
-    'subtract_current_in_xbar' : True,
-    'current_from_input' : True,
-    ## Input quantization
-    'input_bits' : 8,
-    'input_bitslicing' : False,
-    'input_slice_size' : 1,
-    ## ADC
-    'adc_bits' : 8,
-    'adc_range_option' : "CALIBRATED",
-    'adc_type' : "generic",
-    'adc_per_ibit' : False,
-    ## Simulation parameters
-    'useGPU' : useGPU
-    }
-
-### Load input limits
-input_ranges = np.load(os.path.join(os.path.dirname(__file__),'calibrated_config/input_limits_ResNet{:d}.npy').format(depth))
-
-### Load ADC limits
-adc_ranges = find_adc_range(base_params_args, n_layers, depth)
-
-### Set the parameters
-for k in range(n_layers):
-    params_args_k = base_params_args.copy()
-    params_args_k['positiveInputsOnly'] = (False if k == 0 else True)
-    params_args_k['input_range'] = input_ranges[k]
-    params_args_k['adc_range'] = adc_ranges[k]
-    params_list[k] = dnn_inference_params(**params_args_k)
-
-#### Convert PyTorch layers to analog layers
-analog_resnet = from_torch(resnet_model, params_list, fuse_batchnorm=True, bias_rows=0)
-
-#### Load and transform CIFAR-10 dataset
-normalize = transforms.Normalize(
-    mean = [0.485, 0.456, 0.406],
-    std  = [0.229, 0.224, 0.225])
-dataset = datasets.CIFAR10(root='./',train=False, download=True, 
-    transform= transforms.Compose([transforms.ToTensor(), normalize]))
-dataset = torch.utils.data.Subset(dataset, np.arange(N))
-cifar10_dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
-
-#### Run inference and evaluate accuracy
-accuracies = np.zeros(Nruns)
-for m in range(Nruns):
-
-    T1 = time.time()
-    y_pred, y, k = np.zeros(N), np.zeros(N), 0
-    for inputs, labels in cifar10_dataloader:
-        inputs = inputs.to(device)
-        output = analog_resnet(inputs)
-        output = output.to(device)
-        y_pred_k = output.data.cpu().detach().numpy()
-        if batch_size == 1:
-            y_pred[k] = y_pred_k.argmax()
-            y[k] = labels.cpu().detach().numpy()
-            k += 1
-        else:
-            batch_size_k = y_pred_k.shape[0]
-            y_pred[k:(k+batch_size_k)] = y_pred_k.argmax(axis=1)
-            y[k:(k+batch_size_k)] = labels.cpu().detach().numpy()
-            k += batch_size_k
-        if print_progress:
-            print("Image {:d}/{:d}, accuracy so far = {:.2f}%".format(
-                k, N, 100*np.sum(y[:k] == y_pred[:k])/k), end="\r")
+    def __init__(self, num_blocks, in_channels=3, num_classes=10):
+        super().__init__()
+        self.in_planes = 16
+        self.norm_layer = nn.BatchNorm2d
+        self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_planes, momentum=0.99, eps=0.001)
+        self.relu = nn.ReLU(inplace=True)
+        self.res1 = self._make_layer(16, num_blocks, stride=1)
+        self.res2 = self._make_layer(32, num_blocks, stride=2)
+        self.res3 = self._make_layer(64, num_blocks, stride=2)
+        self.classifier = nn.Sequential(nn.AdaptiveAvgPool2d((1,1)), 
+                                        nn.Flatten(), 
+                                        nn.Linear(64, num_classes))
+        
+    def _make_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        downsample = None
+        if stride != 1 or self.in_planes != planes * BasicBlock.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.in_planes, planes * BasicBlock.expansion, stride),
+                self.norm_layer(planes * BasicBlock.expansion),
+            )
+        layers = []
+        layers.append(
+            BasicBlock(self.in_planes, planes*BasicBlock.expansion, stride, downsample))
+        self.in_planes = planes*BasicBlock.expansion
+        for _ in range(1, num_blocks):
+            layers.append(BasicBlock(self.in_planes, planes, norm_layer=self.norm_layer))
+        return nn.Sequential(*layers)
     
-    T2 = time.time()
-    top1 = np.sum(y == y_pred)/len(y)
-    accuracies[m] = top1
-    print("\nInference finished. Elapsed time: {:.3f} sec".format(T2-T1))
-    print('Accuracy: {:.2f}% ({:d}/{:d})\n'.format(top1*100,int(top1*N),N))
-    if m < (Nruns - 1):
-        reinitialize(analog_resnet)
-
-if Nruns > 1:
-    print("==========")
-    print("Mean accuracy:  {:.2f}%".format(100*np.mean(accuracies)))
-    print("Stdev accuracy: {:.2f}%".format(100*np.std(accuracies)))
+    def forward(self, xb):
+        out = self.conv1(xb)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.res1(out)
+        out = self.res2(out)
+        out = self.res3(out)
+        out = self.classifier(out)
+        return out
